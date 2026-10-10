@@ -1,0 +1,629 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Hand Puzzle</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{width:100%;height:100%;overflow:hidden;background:#0d0d14;display:flex;align-items:center;justify-content:center;font-family:'Courier New',monospace}
+#wrap{position:relative;display:block}
+#main{display:block}
+#confetti{position:absolute;top:0;left:0;pointer-events:none}
+video{display:none}
+#hud{position:absolute;top:0;left:0;right:0;display:flex;justify-content:space-between;align-items:center;padding:10px 14px;pointer-events:none;z-index:5}
+.pill{background:rgba(0,0,0,0.55);border:1px solid rgba(255,255,255,0.13);border-radius:20px;color:#fff;font-size:11px;padding:5px 13px;letter-spacing:.07em;backdrop-filter:blur(6px)}
+#hint{position:absolute;bottom:14px;left:50%;transform:translateX(-50%);background:rgba(0,0,0,0.62);border:1px solid rgba(255,255,255,0.1);border-radius:22px;color:rgba(255,255,255,.88);font-size:11px;padding:6px 18px;pointer-events:none;white-space:nowrap;z-index:5;transition:opacity .3s}
+#win-layer{position:absolute;inset:0;display:none;flex-direction:column;align-items:center;justify-content:center;z-index:20;cursor:pointer}
+#win-layer.show{display:flex}
+#win-word{font-size:clamp(48px,12vw,110px);font-weight:900;letter-spacing:.03em;text-align:center;animation:popIn .6s cubic-bezier(.34,1.56,.64,1) forwards;opacity:0}
+#win-sub{margin-top:10px;font-size:14px;color:rgba(255,255,255,.6);animation:popIn .6s .13s cubic-bezier(.34,1.56,.64,1) forwards;opacity:0}
+@keyframes popIn{from{transform:scale(.15) rotate(-8deg);opacity:0}to{transform:scale(1) rotate(0);opacity:1}}
+</style>
+</head>
+<body>
+<video id="v" playsinline autoplay muted></video>
+<div id="wrap">
+  <canvas id="main"></canvas>
+  <canvas id="confetti"></canvas>
+  <div id="hud">
+    <div class="pill" id="p-mode">📷 Two-Hand Draw</div>
+    <div class="pill" id="p-timer">00:00</div>
+    <div class="pill" id="p-moves">— moves</div>
+  </div>
+  <div id="hint">Allow camera → pinch both hands 👌👌 to set corners of a rectangle</div>
+  <div id="win-layer">
+    <div id="win-word">PERFECT!</div>
+    <div id="win-sub">tap to play again</div>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+<script>
+// ─── Setup ────────────────────────────────────────────────────────────────────
+const vid     = document.getElementById('v');
+const cvs     = document.getElementById('main');
+const ctx     = cvs.getContext('2d');
+const confCvs = document.getElementById('confetti');
+const cctx    = confCvs.getContext('2d');
+const wrap    = document.getElementById('wrap');
+const hint    = document.getElementById('hint');
+const pMode   = document.getElementById('p-mode');
+const pTimer  = document.getElementById('p-timer');
+const pMoves  = document.getElementById('p-moves');
+const winLayer= document.getElementById('win-layer');
+const winWord = document.getElementById('win-word');
+const winSub  = document.getElementById('win-sub');
+
+let W=0, H=0;
+function resize(){
+  const asp=4/3;
+  let w=window.innerWidth, h=window.innerHeight;
+  if(w/h>asp) w=Math.round(h*asp); else h=Math.round(w/asp);
+  W=w; H=h;
+  [cvs,confCvs].forEach(c=>{c.width=W;c.height=H;c.style.width=W+'px';c.style.height=H+'px'});
+  wrap.style.width=W+'px'; wrap.style.height=H+'px';
+}
+resize();
+window.addEventListener('resize',resize);
+
+// ─── State ────────────────────────────────────────────────────────────────────
+// phase: 'draw' | 'puzzle' | 'win'
+let phase='draw';
+
+// Hand landmarks in canvas pixels (mirrored)
+let lmL=null, lmR=null; // left/right from user's perspective
+
+// Two-hand capture
+// Each hand pinches independently. When both are pinching → define rect corners
+let leftPinch=false,  rightPinch=false;
+let leftPt=null,      rightPt=null;   // index-tip positions
+let rectConfirmed=false;              // both pinched and held
+let confirmTimer=0;                  // ms both held together
+const CONFIRM_HOLD=600;              // ms to hold before capture flashes
+
+// Puzzle
+const GRID=3;
+const GAP=4;
+let snapCanvas=null;
+let puzzleRect=null;   // {x,y,w,h}
+let pieces=[];         // [{img:OffscreenCanvas,origIdx}] x9
+let positions=[];      // positions[i] = {x,y,w,h} current board slot of piece i's SLOT
+let order=[];          // order[slotIdx]=pieceIdx  (which piece sits in that slot)
+let selected=-1;       // slotIdx currently pinched/selected
+let dragging=false;
+let dragPiece=-1;      // pieceIdx being dragged
+let dragX=0, dragY=0; // canvas coords of drag anchor
+let dragOffX=0, dragOffY=0;
+let moves=0;
+
+// Timer
+let tStart=0, tIv=null;
+
+// Puzzle hand control
+let pzPinchL=false, pzPinchR=false;
+let activeDragHand=null; // 'L' or 'R'
+let pzCooldown=0;
+
+// Confetti
+let confParts=[], confAF=null;
+const CONF_COLS=['#ffd700','#00ffcc','#ff6ec7','#fff','#a78bfa','#fb923c','#38bdf8'];
+
+// ─── MediaPipe ────────────────────────────────────────────────────────────────
+const HCONN=[
+  [0,1],[1,2],[2,3],[3,4],
+  [0,5],[5,6],[6,7],[7,8],
+  [5,9],[9,10],[10,11],[11,12],
+  [9,13],[13,14],[14,15],[15,16],
+  [13,17],[17,18],[18,19],[19,20],
+  [0,17]
+];
+
+const MP = new Hands({locateFile:f=>`https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}`});
+MP.setOptions({maxNumHands:2,modelComplexity:1,minDetectionConfidence:.72,minTrackingConfidence:.65});
+MP.onResults(r=>{
+  lmL=null; lmR=null;
+  if(!r.multiHandLandmarks) return;
+  r.multiHandLandmarks.forEach((lm,i)=>{
+    // MP's 'Left' is user's right (before mirror), 'Right' is user's left
+    if(r.multiHandedness[i].label==='Left')  lmR=lm;
+    else                                      lmL=lm;
+  });
+});
+
+async function startCam(){
+  try{
+    const stream=await navigator.mediaDevices.getUserMedia({video:{width:1280,height:720,facingMode:'user'},audio:false});
+    vid.srcObject=stream; await vid.play();
+    new Camera(vid,{onFrame:async()=>{await MP.send({image:vid})},width:1280,height:720}).start();
+    hint.textContent='Pinch BOTH hands 👌👌 to mark opposite corners of a rectangle';
+  } catch(e){
+    hint.textContent='❌ Camera denied — reload and allow access';
+  }
+}
+startCam();
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+function lmPx(lm,idx){return{x:(1-lm[idx].x)*W, y:lm[idx].y*H};}
+function pd(lm){const a=lm[4],b=lm[8];return Math.hypot(a.x-b.x,a.y-b.y);}
+function isPinch(lm){return pd(lm)<0.072;}
+
+function drawMirroredFeed(){
+  if(vid.readyState<2) return;
+  ctx.save(); ctx.translate(W,0); ctx.scale(-1,1);
+  ctx.drawImage(vid,0,0,W,H); ctx.restore();
+}
+
+function drawSkeleton(lm,col,alpha=1){
+  ctx.save(); ctx.globalAlpha=alpha;
+  HCONN.forEach(([a,b])=>{
+    const pa=lmPx(lm,a), pb=lmPx(lm,b);
+    ctx.beginPath(); ctx.moveTo(pa.x,pa.y); ctx.lineTo(pb.x,pb.y);
+    ctx.strokeStyle=col+'55'; ctx.lineWidth=1.5; ctx.stroke();
+  });
+  lm.forEach((_,i)=>{
+    const p=lmPx(lm,i);
+    ctx.beginPath(); ctx.arc(p.x,p.y,i===4||i===8?5:3,0,Math.PI*2);
+    ctx.fillStyle=i===4||i===8?col:col+'88'; ctx.fill();
+  });
+  ctx.restore();
+}
+
+function drawPinchCursor(pt,pinched,col){
+  ctx.beginPath();
+  ctx.arc(pt.x,pt.y,pinched?13:8,0,Math.PI*2);
+  ctx.strokeStyle=col; ctx.lineWidth=2.5; ctx.stroke();
+  if(pinched){
+    ctx.fillStyle=col+'30'; ctx.fill();
+    ctx.beginPath(); ctx.arc(pt.x,pt.y,4,0,Math.PI*2);
+    ctx.fillStyle=col; ctx.fill();
+  }
+}
+
+// ─── Main loop ────────────────────────────────────────────────────────────────
+let prevT=0;
+function loop(t){
+  requestAnimationFrame(loop);
+  const dt=Math.min(t-prevT,50); prevT=t;
+  if(pzCooldown>0) pzCooldown-=dt;
+
+  ctx.clearRect(0,0,W,H);
+
+  // Always draw live camera feed underneath everything
+  drawMirroredFeed();
+
+  if(phase==='draw')   tickDraw(dt,t);
+  else if(phase==='puzzle') tickPuzzle(t,dt);
+  else if(phase==='win')    tickWin(t);
+}
+requestAnimationFrame(loop);
+
+// ─── DRAW PHASE ───────────────────────────────────────────────────────────────
+function tickDraw(dt,t){
+  // Update hand positions
+  leftPt  = lmL ? lmPx(lmL,8) : leftPt;
+  rightPt = lmR ? lmPx(lmR,8) : rightPt;
+  leftPinch  = lmL ? isPinch(lmL) : false;
+  rightPinch = lmR ? isPinch(lmR) : false;
+
+  const bothPinching = leftPinch && rightPinch && leftPt && rightPt;
+
+  // Draw a light vignette so hands stand out
+  const grad=ctx.createRadialGradient(W/2,H/2,H*0.25,W/2,H/2,H*0.75);
+  grad.addColorStop(0,'rgba(0,0,0,0)');
+  grad.addColorStop(1,'rgba(0,0,0,0.35)');
+  ctx.fillStyle=grad; ctx.fillRect(0,0,W,H);
+
+  if(bothPinching){
+    confirmTimer+=dt;
+    const progress=Math.min(confirmTimer/CONFIRM_HOLD,1);
+    drawTwoHandRect(leftPt,rightPt,t,progress);
+
+    if(confirmTimer>=CONFIRM_HOLD){
+      confirmTimer=0;
+      captureRegion(leftPt,rightPt);
+      return;
+    }
+    hint.textContent=`Hold still… ${Math.round(progress*100)}%`;
+  } else {
+    confirmTimer=Math.max(0,confirmTimer-dt*2);
+    // Preview rect if one hand pinching
+    if((leftPinch&&leftPt)||(rightPinch&&rightPt)){
+      hint.textContent='Now pinch the other hand 👌 at the opposite corner!';
+    } else {
+      hint.textContent='Pinch BOTH hands 👌👌 to mark opposite corners of a rectangle';
+    }
+    // Show partial rect if both pts known
+    if(leftPt&&rightPt&&(leftPinch||rightPinch)){
+      drawTwoHandRect(leftPt,rightPt,t,0);
+    }
+  }
+
+  // Draw skeletons
+  if(lmL) drawSkeleton(lmL,'#00ffcc');
+  if(lmR) drawSkeleton(lmR,'#ff9adb');
+  if(leftPt)  drawPinchCursor(leftPt, leftPinch, '#00ffcc');
+  if(rightPt) drawPinchCursor(rightPt,rightPinch,'#ff9adb');
+
+  // Label hands
+  if(leftPt){
+    ctx.fillStyle='rgba(0,255,204,0.8)'; ctx.font='bold 10px Courier New';
+    ctx.fillText('L',leftPt.x-4,leftPt.y-18);
+  }
+  if(rightPt){
+    ctx.fillStyle='rgba(255,154,219,0.8)'; ctx.font='bold 10px Courier New';
+    ctx.fillText('R',rightPt.x-4,rightPt.y-18);
+  }
+}
+
+function drawTwoHandRect(a,b,t,progress){
+  const x=Math.min(a.x,b.x), y=Math.min(a.y,b.y);
+  const w=Math.abs(a.x-b.x), h=Math.abs(a.y-b.y);
+  if(w<10||h<10) return;
+
+  // White animated dashed border
+  ctx.save();
+  const dashOff=(t/5)%24;
+  ctx.setLineDash([12,8]); ctx.lineDashOffset=-dashOff;
+  ctx.strokeStyle='rgba(255,255,255,0.95)'; ctx.lineWidth=2.5;
+  ctx.strokeRect(x,y,w,h);
+  ctx.setLineDash([]);
+  ctx.restore();
+
+  // Progress arc fill on border
+  if(progress>0){
+    ctx.save();
+    ctx.strokeStyle=`rgba(255,215,0,${progress})`;
+    ctx.lineWidth=3;
+    const perimeter=2*(w+h);
+    const drawn=perimeter*progress;
+    // Draw as filled overlay border
+    ctx.fillStyle=`rgba(255,215,0,${progress*0.08})`;
+    ctx.fillRect(x,y,w,h);
+    ctx.restore();
+  }
+
+  // Corner handles
+  ctx.save();
+  const cs=20;
+  const corners=[[x,y,1,1,'#00ffcc'],[x+w,y,-1,1,'#ff9adb'],[x,y+h,1,-1,'#ff9adb'],[x+w,y+h,-1,-1,'#00ffcc']];
+  corners.forEach(([cx,cy,dx,dy,col])=>{
+    ctx.strokeStyle=col; ctx.lineWidth=3.5;
+    ctx.beginPath(); ctx.moveTo(cx+dx*cs,cy); ctx.lineTo(cx,cy); ctx.lineTo(cx,cy+dy*cs); ctx.stroke();
+    // dot at corner
+    ctx.beginPath(); ctx.arc(cx,cy,5,0,Math.PI*2);
+    ctx.fillStyle=col; ctx.fill();
+  });
+  ctx.restore();
+
+  // Connecting dashed lines from hands to corners
+  ctx.save();
+  ctx.setLineDash([4,6]); ctx.globalAlpha=0.35; ctx.lineWidth=1;
+  ctx.strokeStyle='#00ffcc';
+  ctx.beginPath(); ctx.moveTo(a.x,a.y); ctx.lineTo(x,y); ctx.stroke();
+  ctx.strokeStyle='#ff9adb';
+  ctx.beginPath(); ctx.moveTo(b.x,b.y); ctx.lineTo(x+w,y+h); ctx.stroke();
+  ctx.restore();
+
+  // Size label
+  ctx.font='bold 12px "Courier New"';
+  const lbl=`${Math.round(w)}×${Math.round(h)}`;
+  const lw=ctx.measureText(lbl).width;
+  ctx.fillStyle='rgba(0,0,0,0.7)'; ctx.fillRect(x+w/2-lw/2-6,y-24,lw+12,20);
+  ctx.fillStyle='#ffd700'; ctx.textAlign='center';
+  ctx.fillText(lbl,x+w/2,y-9); ctx.textAlign='left';
+}
+
+// Flash effect on capture
+function captureRegion(a,b){
+  // White flash
+  ctx.fillStyle='rgba(255,255,255,0.6)'; ctx.fillRect(0,0,W,H);
+
+  // Snapshot
+  snapCanvas=document.createElement('canvas');
+  snapCanvas.width=W; snapCanvas.height=H;
+  const sc=snapCanvas.getContext('2d');
+  sc.translate(W,0); sc.scale(-1,1);
+  sc.drawImage(vid,0,0,W,H);
+
+  const x=Math.min(a.x,b.x), y=Math.min(a.y,b.y);
+  const w=Math.abs(a.x-b.x), h=Math.abs(a.y-b.y);
+  puzzleRect={x,y,w,h};
+  buildPuzzle();
+  phase='puzzle';
+  pMode.textContent='🧩 Puzzle';
+  hint.textContent='Pinch 👌 a piece and drag it to swap • or click & drag';
+  pzCooldown=800;
+  moves=0; pMoves.textContent='0 moves';
+  startTmr();
+}
+
+// ─── BUILD PUZZLE ─────────────────────────────────────────────────────────────
+function buildPuzzle(){
+  pieces=[];
+  const {x,y,w,h}=puzzleRect;
+  const pw=w/GRID, ph=h/GRID;
+  for(let r=0;r<GRID;r++) for(let c=0;c<GRID;c++){
+    const pc=document.createElement('canvas');
+    pc.width=Math.round(pw); pc.height=Math.round(ph);
+    pc.getContext('2d').drawImage(snapCanvas,x+c*pw,y+r*ph,pw,ph,0,0,pc.width,pc.height);
+    pieces.push({img:pc,origIdx:r*GRID+c});
+  }
+  order=Array.from({length:9},(_,i)=>i);
+  // Shuffle
+  do{ for(let i=8;i>0;i--){const j=Math.floor(Math.random()*(i+1));[order[i],order[j]]=[order[j],order[i]];}}
+  while(order.every((v,i)=>v===i));
+  selected=-1; dragging=false; dragPiece=-1;
+}
+
+function slotRect(slotIdx){
+  const {x,y,w,h}=puzzleRect;
+  const pw=w/GRID, ph=h/GRID;
+  const c=slotIdx%GRID, r=Math.floor(slotIdx/GRID);
+  return{x:x+c*pw+GAP/2, y:y+r*ph+GAP/2, w:pw-GAP, h:ph-GAP};
+}
+
+function slotAt(px,py){
+  const {x,y,w,h}=puzzleRect;
+  const pw=w/GRID, ph=h/GRID;
+  const c=Math.floor((px-x)/pw), r=Math.floor((py-y)/ph);
+  if(c<0||c>=GRID||r<0||r>=GRID) return -1;
+  return r*GRID+c;
+}
+
+// ─── PUZZLE PHASE ─────────────────────────────────────────────────────────────
+function tickPuzzle(t,dt){
+  // Draw live camera as subtle bg (full brightness)
+  // already drawn at top of loop — now overlay a gentle darkening only outside puzzle
+  const {x,y,w,h}=puzzleRect;
+  ctx.save();
+  ctx.fillStyle='rgba(0,0,0,0.42)';
+  ctx.beginPath();
+  ctx.rect(0,0,W,H);
+  ctx.rect(x,y,w,h);
+  ctx.fill('evenodd');
+  ctx.restore();
+
+  // Draw pieces in slots
+  for(let si=0;si<9;si++){
+    if(dragging && order[si]===dragPiece) continue; // skip — drawn separately
+    const pi=order[si];
+    const sr=slotRect(si);
+    const isCorrect=pi===si;
+
+    ctx.save();
+    ctx.drawImage(pieces[pi].img, sr.x,sr.y,sr.w,sr.h);
+    // Correct tint
+    if(isCorrect){ctx.fillStyle='rgba(0,255,120,0.18)';ctx.fillRect(sr.x,sr.y,sr.w,sr.h);}
+    // Border
+    ctx.strokeStyle=isCorrect?'rgba(0,255,120,0.5)':'rgba(255,255,255,0.12)';
+    ctx.lineWidth=1; ctx.strokeRect(sr.x,sr.y,sr.w,sr.h);
+    ctx.restore();
+  }
+
+  // Draw dragged piece on top following hand
+  if(dragging && dragPiece>=0){
+    const pi=dragPiece;
+    const {w:pw,h:ph}=slotRect(0); // piece size
+    ctx.save();
+    ctx.shadowColor='rgba(0,0,0,0.5)'; ctx.shadowBlur=18;
+    ctx.globalAlpha=0.9;
+    ctx.drawImage(pieces[pi].img, dragX-pw/2, dragY-ph/2, pw, ph);
+    ctx.globalAlpha=1; ctx.shadowBlur=0;
+    // Glowing border
+    ctx.strokeStyle='#00ffcc'; ctx.lineWidth=2.5;
+    ctx.strokeRect(dragX-pw/2,dragY-ph/2,pw,ph);
+    ctx.restore();
+
+    // Show target slot highlight
+    const tsi=slotAt(dragX,dragY);
+    if(tsi>=0){
+      const ts=slotRect(tsi);
+      ctx.save();
+      ctx.fillStyle='rgba(0,255,204,0.15)'; ctx.fillRect(ts.x,ts.y,ts.w,ts.h);
+      ctx.strokeStyle='#00ffcc'; ctx.lineWidth=2;
+      ctx.setLineDash([6,4]); ctx.strokeRect(ts.x,ts.y,ts.w,ts.h);
+      ctx.restore();
+    }
+  }
+
+  // Puzzle outer border
+  ctx.strokeStyle='rgba(255,255,255,0.25)'; ctx.lineWidth=2;
+  ctx.strokeRect(x,y,w,h);
+  // Grid lines
+  const pw2=w/GRID, ph2=h/GRID;
+  ctx.strokeStyle='rgba(255,255,255,0.07)'; ctx.lineWidth=1;
+  for(let i=1;i<GRID;i++){
+    ctx.beginPath(); ctx.moveTo(x+i*pw2,y); ctx.lineTo(x+i*pw2,y+h); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(x,y+i*ph2); ctx.lineTo(x+w,y+i*ph2); ctx.stroke();
+  }
+
+  // Hand tracking for drag
+  handlePuzzleHands(dt);
+}
+
+function handlePuzzleHands(dt){
+  if(pzCooldown>0){
+    if(lmL) drawSkeleton(lmL,'#00ffcc',0.5);
+    if(lmR) drawSkeleton(lmR,'#ff9adb',0.5);
+    return;
+  }
+
+  // Use whichever hand is not null (prefer right hand = lmR in our convention)
+  const activeLm = lmR || lmL;
+  const activeLabel = lmR ? 'R' : 'L';
+  if(!activeLm){ if(dragging){dropPiece(dragX,dragY); dragging=false; dragPiece=-1;} return; }
+
+  const tip = lmPx(activeLm,8);
+  const pinching = isPinch(activeLm);
+
+  // Update drag position
+  if(dragging){ dragX=tip.x; dragY=tip.y; }
+
+  // Draw other hand skeleton softly
+  const otherLm = lmR ? lmL : lmR;
+  if(otherLm) drawSkeleton(otherLm, lmR ? '#00ffcc' : '#ff9adb', 0.35);
+
+  // Draw active hand
+  drawSkeleton(activeLm, activeLabel==='R' ? '#ff9adb' : '#00ffcc', 0.8);
+
+  // Cursor
+  const col = activeLabel==='R' ? '#ff9adb' : '#00ffcc';
+  drawPinchCursor(tip, pinching, col);
+
+  if(pinching && !dragging && pzCooldown<=0){
+    // Start drag
+    const si=slotAt(tip.x,tip.y);
+    if(si>=0){
+      dragPiece=order[si];
+      dragging=true;
+      dragX=tip.x; dragY=tip.y;
+      hint.textContent='✦ Dragging — move to target slot and release!';
+      pzCooldown=200;
+    }
+  }
+
+  if(!pinching && dragging){
+    dropPiece(tip.x, tip.y);
+  }
+}
+
+function dropPiece(px,py){
+  const targetSlot=slotAt(px,py);
+  if(targetSlot>=0 && dragPiece>=0){
+    // Find which slot dragPiece is currently in
+    const srcSlot=order.indexOf(dragPiece);
+    if(srcSlot>=0 && srcSlot!==targetSlot){
+      [order[srcSlot],order[targetSlot]]=[order[targetSlot],order[srcSlot]];
+      moves++; pMoves.textContent=moves+' move'+(moves===1?'':'s');
+    }
+  }
+  dragging=false; dragPiece=-1;
+  hint.textContent='Pinch 👌 a piece and drag to swap';
+  pzCooldown=300;
+  if(order.every((v,i)=>v===i)) setTimeout(triggerWin,350);
+}
+
+// Mouse / touch drag for puzzle (fallback)
+let mouseDragging=false, mouseDragPiece=-1, mouseDX=0, mouseDY=0;
+document.getElementById('main').addEventListener('mousedown',e=>{
+  if(phase!=='puzzle') return;
+  const r=cvs.getBoundingClientRect();
+  const cx=(e.clientX-r.left)*(W/r.width), cy=(e.clientY-r.top)*(H/r.height);
+  const si=slotAt(cx,cy);
+  if(si>=0){mouseDragging=true; mouseDragPiece=order[si]; mouseDX=cx; mouseDY=cy;}
+});
+document.addEventListener('mousemove',e=>{
+  if(!mouseDragging) return;
+  const r=cvs.getBoundingClientRect();
+  mouseDX=(e.clientX-r.left)*(W/r.width); mouseDY=(e.clientY-r.top)*(H/r.height);
+  if(!dragging){ dragging=true; dragPiece=mouseDragPiece; }
+  dragX=mouseDX; dragY=mouseDY;
+});
+document.addEventListener('mouseup',e=>{
+  if(!mouseDragging) return;
+  mouseDragging=false;
+  if(dragging){ dropPiece(dragX,dragY); dragging=false; dragPiece=-1; }
+});
+// Touch
+document.getElementById('main').addEventListener('touchstart',e=>{
+  if(phase!=='puzzle') return;
+  e.preventDefault();
+  const r=cvs.getBoundingClientRect(), t=e.touches[0];
+  const cx=(t.clientX-r.left)*(W/r.width), cy=(t.clientY-r.top)*(H/r.height);
+  const si=slotAt(cx,cy);
+  if(si>=0){mouseDragging=true; mouseDragPiece=order[si]; mouseDX=cx; mouseDY=cy; dragging=true; dragPiece=order[si]; dragX=cx; dragY=cy;}
+},{passive:false});
+document.addEventListener('touchmove',e=>{
+  if(!mouseDragging) return; e.preventDefault();
+  const r=cvs.getBoundingClientRect(), t=e.touches[0];
+  dragX=(t.clientX-r.left)*(W/r.width); dragY=(t.clientY-r.top)*(H/r.height);
+},{passive:false});
+document.addEventListener('touchend',e=>{
+  if(!mouseDragging) return;
+  mouseDragging=false;
+  if(dragging){ dropPiece(dragX,dragY); dragging=false; dragPiece=-1; }
+});
+
+// ─── WIN PHASE ────────────────────────────────────────────────────────────────
+function triggerWin(){
+  phase='win';
+  const el=stopTmr();
+  const m=Math.floor(el/60), s=el%60;
+  let label,col;
+  if(el<=60){label='PERFECT!';col='#ffd700';}
+  else if(el<=150){label='SUPER!';col='#00ffcc';}
+  else{label='FABULOUS!';col='#ff6ec7';}
+  winWord.textContent=label; winWord.style.color=col;
+  winWord.style.textShadow=`0 0 60px ${col}88,0 0 120px ${col}33`;
+  winSub.textContent=`${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')} · ${moves} moves · tap to play again`;
+  winLayer.classList.add('show');
+  pMode.textContent='🏆 Done!'; hint.textContent='';
+  launchConf();
+}
+
+let winPhaseT=0;
+function tickWin(t){
+  if(winPhaseT===0) winPhaseT=t;
+  // Camera still visible behind
+  if(snapCanvas&&puzzleRect){
+    const{x,y,w,h}=puzzleRect;
+    // Dark overlay except puzzle area
+    ctx.fillStyle='rgba(0,0,0,0.55)'; ctx.fillRect(0,0,W,H);
+    // Draw assembled image
+    ctx.drawImage(snapCanvas,x,y,w,h,x,y,w,h);
+    // Pulsing gold border
+    const pulse=2+2*Math.sin(t/200);
+    ctx.save();
+    ctx.shadowColor='#ffd700'; ctx.shadowBlur=20+8*Math.sin(t/180);
+    ctx.strokeStyle='#ffd700'; ctx.lineWidth=pulse;
+    ctx.strokeRect(x,y,w,h); ctx.restore();
+  }
+}
+
+winLayer.addEventListener('click',resetGame);
+function resetGame(){
+  winLayer.classList.remove('show');
+  stopConf(); winPhaseT=0;
+  phase='draw';
+  pMode.textContent='📷 Two-Hand Draw';
+  pTimer.textContent='00:00'; pMoves.textContent='— moves';
+  hint.textContent='Pinch BOTH hands 👌👌 to mark opposite corners of a rectangle';
+  leftPinch=rightPinch=false; leftPt=rightPt=null; rectConfirmed=false; confirmTimer=0;
+  selected=-1; dragging=false; dragPiece=-1; moves=0;
+  mouseDragging=false; mouseDragPiece=-1;
+  snapCanvas=null; puzzleRect=null; pieces=[]; order=[];
+}
+
+// ─── Timer ────────────────────────────────────────────────────────────────────
+function startTmr(){tStart=Date.now();clearInterval(tIv);tIv=setInterval(()=>{const s=Math.floor((Date.now()-tStart)/1e3);pTimer.textContent=String(Math.floor(s/60)).padStart(2,'0')+':'+String(s%60).padStart(2,'0');},500);}
+function stopTmr(){clearInterval(tIv);return Math.floor((Date.now()-tStart)/1e3);}
+
+// ─── Confetti ─────────────────────────────────────────────────────────────────
+function launchConf(){
+  confParts=Array.from({length:170},()=>({
+    x:Math.random()*W, y:-10-Math.random()*250,
+    vx:(Math.random()-.5)*5, vy:1.5+Math.random()*5,
+    w:5+Math.random()*10, h:3+Math.random()*8,
+    rot:Math.random()*360, rv:(Math.random()-.5)*7,
+    col:CONF_COLS[Math.floor(Math.random()*CONF_COLS.length)]
+  }));
+  cancelAnimationFrame(confAF); animConf();
+}
+function animConf(){
+  cctx.clearRect(0,0,W,H);
+  confParts.forEach(p=>{
+    p.x+=p.vx; p.y+=p.vy; p.rot+=p.rv;
+    cctx.save(); cctx.translate(p.x,p.y); cctx.rotate(p.rot*Math.PI/180);
+    cctx.fillStyle=p.col; cctx.fillRect(-p.w/2,-p.h/2,p.w,p.h); cctx.restore();
+  });
+  confParts=confParts.filter(p=>p.y<H+30);
+  if(confParts.length) confAF=requestAnimationFrame(animConf);
+  else cctx.clearRect(0,0,W,H);
+}
+function stopConf(){cancelAnimationFrame(confAF);cctx.clearRect(0,0,W,H);confParts=[];}
+</script>
+</body>
+</html>
